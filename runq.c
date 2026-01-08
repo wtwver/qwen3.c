@@ -13,87 +13,19 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#include "qwen3.h"
+#include "npu_matmul.h"
 
 // ----------------------------------------------------------------------------
 // Globals
 int GS = 0; // group size global for quantization of the weights
+static NpuMatmulContext g_npu;
 
 // Maximum input prompt buffer size
 #define PROMPT_BUFFER_SIZE 32768
 
 // ----------------------------------------------------------------------------
-// Transformer model
-
-typedef struct {
-    int magic_number; // checkpoint magic number
-    int version; // file format version
-    int dim; // transformer dimension
-    int hidden_dim; // for ffn layers
-    int n_layers; // number of layers
-    int n_heads; // number of query heads
-    int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int vocab_size; // vocabulary size, usually 256 (byte-level)
-    int seq_len; // max sequence length
-    int head_dim; // head dimension
-    int shared_classifier; // 1 if wcls == p_tokens
-    int group_size; // quantization group size (export.py uses 64)
-} Config;
-
-typedef struct {
-    int8_t *q;    // quantized values
-    float *s; // scaling factors
-} QuantizedTensor;
-
-typedef struct {
-    // token embedding table
-    QuantizedTensor *q_tokens; // (vocab_size, dim)
-    float *token_embedding_table; // same, but dequantized
-    // weights for rmsnorms
-    float *rms_att_weight; // (layer, dim) rmsnorm weights
-    float *rms_ffn_weight; // (layer, dim)
-    // weights for matmuls. note dim == n_heads * head_size
-    QuantizedTensor *wq; // (layer, dim, n_heads * head_size)
-    QuantizedTensor *wk; // (layer, dim, n_kv_heads * head_size)
-    QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
-    QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
-    // QK-RMSNorm for Qwen3
-    float *q_norm_weights;
-    float *k_norm_weights;
-    // weights for ffn
-    QuantizedTensor *w1; // (layer, hidden_dim, dim)
-    QuantizedTensor *w2; // (layer, dim, hidden_dim)
-    QuantizedTensor *w3; // (layer, hidden_dim, dim)
-    // final rmsnorm
-    float *rms_final_weight; // (dim,)
-    // (optional) classifier weights for the logits, on the last layer
-    QuantizedTensor *wcls;
-} TransformerWeights;
-
-typedef struct {
-    // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
-    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    QuantizedTensor xq; // quantized x (dim,)
-    QuantizedTensor hq; // quantized hb (hidden_dim,)
-    float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
-    // kv cache
-    float *key_cache;   // (layer, seq_len, dim)
-    float *value_cache; // (layer, seq_len, dim)
-} RunState;
-
-typedef struct {
-    Config config; // the hyperparameters of the architecture (the blueprint)
-    TransformerWeights weights; // the weights of the model
-    RunState state; // buffers for the "wave" of activations in the forward pass
-    float *data; // memory mapped data pointer
-    ssize_t file_size; // size of the checkpoint file in bytes
-} Transformer;
+// Transformer model (see qwen3.h)
 
 void malloc_run_state(RunState* s, Config *p) {
     // we calloc instead of malloc to keep valgrind happy
@@ -352,10 +284,27 @@ float *forward(Transformer *transformer, int token, int pos) {
         rmsnorm(s->xb, s->x, w->rms_att_weight + l * p->dim, p->dim);
 
         // qkv matmuls for this position
-        quantize(&s->xq, s->xb, p->dim);
-        matmul(s->q, &s->xq, w->wq + l, p->dim, all_heads_dim);
-        matmul(s->k, &s->xq, w->wk + l, p->dim, kv_dim);
-        matmul(s->v, &s->xq, w->wv + l, p->dim, kv_dim);
+        int used_wq = npu_matmul_run(&g_npu, NPU_MATMUL_WQ, l, s->xb, s->q);
+        int used_wk = npu_matmul_run(&g_npu, NPU_MATMUL_WK, l, s->xb, s->k);
+        int used_wv = npu_matmul_run(&g_npu, NPU_MATMUL_WV, l, s->xb, s->v);
+        if (!(used_wq && used_wk && used_wv)) {
+            quantize(&s->xq, s->xb, p->dim);
+            if (!used_wq) {
+                fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->dim, all_heads_dim);
+                matmul(s->q, &s->xq, w->wq + l, p->dim, all_heads_dim);
+                g_npu.cpu_ops++;
+            }
+            if (!used_wk) {
+                fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->dim, kv_dim);
+                matmul(s->k, &s->xq, w->wk + l, p->dim, kv_dim);
+                g_npu.cpu_ops++;
+            }
+            if (!used_wv) {
+                fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->dim, kv_dim);
+                matmul(s->v, &s->xq, w->wv + l, p->dim, kv_dim);
+                g_npu.cpu_ops++;
+            }
+        }
 
         /* ------------ Q-RMSNorm + rotate each query head ------------- */
         for (int h = 0; h < p->n_heads; h++) {
@@ -427,8 +376,13 @@ float *forward(Transformer *transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
-        quantize(&s->xq, s->xb, all_heads_dim);
-        matmul(s->xb, &s->xq, w->wo + l, all_heads_dim, p->dim);
+        int used_wo = npu_matmul_run(&g_npu, NPU_MATMUL_WO, l, s->xb, s->xb);
+        if (!used_wo) {
+            quantize(&s->xq, s->xb, all_heads_dim);
+            fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", all_heads_dim, p->dim);
+            matmul(s->xb, &s->xq, w->wo + l, all_heads_dim, p->dim);
+            g_npu.cpu_ops++;
+        }
 
         // residual connection back into s->x
         for (int i = 0; i < p->dim; i++)
@@ -439,9 +393,21 @@ float *forward(Transformer *transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        quantize(&s->xq, s->xb, p->dim);
-        matmul(s->hb, &s->xq, w->w1 + l, p->dim, p->hidden_dim);
-        matmul(s->hb2, &s->xq, w->w3 + l, p->dim, p->hidden_dim);
+        int used_w1 = npu_matmul_run(&g_npu, NPU_MATMUL_W1, l, s->xb, s->hb);
+        int used_w3 = npu_matmul_run(&g_npu, NPU_MATMUL_W3, l, s->xb, s->hb2);
+        if (!(used_w1 && used_w3)) {
+            quantize(&s->xq, s->xb, p->dim);
+            if (!used_w1) {
+                fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->dim, p->hidden_dim);
+                matmul(s->hb, &s->xq, w->w1 + l, p->dim, p->hidden_dim);
+                g_npu.cpu_ops++;
+            }
+            if (!used_w3) {
+                fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->dim, p->hidden_dim);
+                matmul(s->hb2, &s->xq, w->w3 + l, p->dim, p->hidden_dim);
+                g_npu.cpu_ops++;
+            }
+        }
 
         // SwiGLU non-linearity
         // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
@@ -449,8 +415,13 @@ float *forward(Transformer *transformer, int token, int pos) {
             s->hb[i] *= s->hb2[i] * (1.0f / (1.0f + expf(-s->hb[i])));
 
         // final matmul to get the output of the ffn
-        quantize(&s->hq, s->hb, p->hidden_dim);
-        matmul(s->xb, &s->hq, w->w2 + l, p->hidden_dim, p->dim);
+        int used_w2 = npu_matmul_run(&g_npu, NPU_MATMUL_W2, l, s->hb, s->xb);
+        if (!used_w2) {
+            quantize(&s->hq, s->hb, p->hidden_dim);
+            fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->hidden_dim, p->dim);
+            matmul(s->xb, &s->hq, w->w2 + l, p->hidden_dim, p->dim);
+            g_npu.cpu_ops++;
+        }
 
         // residual connection
         for (int i = 0; i < p->dim; i++)
@@ -461,8 +432,13 @@ float *forward(Transformer *transformer, int token, int pos) {
     rmsnorm(s->x, s->x, w->rms_final_weight, p->dim);
 
     // classifier into logits
-    quantize(&s->xq, s->x, p->dim);
-    matmul(s->logits, &s->xq, w->wcls, p->dim, p->vocab_size);
+    int used_wcls = npu_matmul_run(&g_npu, NPU_MATMUL_WCLS, 0, s->x, s->logits);
+    if (!used_wcls) {
+        quantize(&s->xq, s->x, p->dim);
+        fprintf(stderr, "matmul cpu M=1 K=%d N=%d\n", p->dim, p->vocab_size);
+        matmul(s->logits, &s->xq, w->wcls, p->dim, p->vocab_size);
+        g_npu.cpu_ops++;
+    }
     return s->logits;
 }
 
@@ -785,7 +761,7 @@ int sample(Sampler *sampler, float *logits) {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt) {
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int max_tokens) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -802,6 +778,17 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int next;        // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
+    int generated = 0;
+    size_t prompt_len = strlen(prompt);
+    size_t out_cap = prompt_len + 256;
+    size_t out_len = 0;
+    char *out_buf = (char*)malloc(out_cap);
+    if (!out_buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    out_buf[0] = 0;
+    if (prompt_len > 0) {
+        printf("%s\n", prompt);
+        fflush(stdout);
+    }
 
     while (pos < transformer->config.seq_len) {
         // forward the transformer to get logits for the next token
@@ -817,17 +804,33 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         }
         pos++;
 
-        // print the token as string, decode it with the Tokenizer object
-        printf("%s", decode(tokenizer, token));
-        fflush(stdout);
+        if (pos >= num_prompt_tokens) {
+            const char *tok = decode(tokenizer, token);
+            size_t tok_len = strlen(tok);
+            if (out_len + tok_len + 1 > out_cap) {
+                out_cap = (out_len + tok_len + 1) * 2;
+                out_buf = (char*)realloc(out_buf, out_cap);
+                if (!out_buf) { fprintf(stderr, "realloc failed!\n"); exit(EXIT_FAILURE); }
+            }
+            memcpy(out_buf + out_len, tok, tok_len);
+            out_len += tok_len;
+            out_buf[out_len] = 0;
+            generated++;
+            printf("%s%s\n", prompt, out_buf);
+            fflush(stdout);
+        }
         token = next;
 
         // data-dependent terminating condition: the BOS token delimits sequences
         if (pos >= num_prompt_tokens && (next == tokenizer->bos_token_id || next == tokenizer->eos_token_id))
             break;
+        if (pos >= num_prompt_tokens) {
+            if (max_tokens > 0 && generated >= max_tokens) break;
+        }
     }
     printf("\n");
     free(prompt_tokens);
+    free(out_buf);
 }
 
 void read_stdin(const char *guide, char *buffer, size_t bufsize) {
@@ -843,7 +846,7 @@ void read_stdin(const char *guide, char *buffer, size_t bufsize) {
 // ----------------------------------------------------------------------------
 // chat loop
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *system_prompt) {
+void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *system_prompt, int max_tokens) {
     // buffers for reading the system prompt and user prompt from stdin
     char user_prompt[PROMPT_BUFFER_SIZE];
     char rendered_prompt[PROMPT_BUFFER_SIZE];
@@ -855,6 +858,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
     int pos = 0;     // position in the sequence
+    int generated = 0;
 
     while (1) {
         // if context window is exceeded, clear it
@@ -913,7 +917,10 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
                 user_turn = 1;
             } else if (next != tokenizer->bos_token_id && next != tokenizer->eos_token_id) {
                 printf("%s", decode(tokenizer, next));
+                generated++;
+                printf(" [#%d]", generated);
                 fflush(stdout);
+                if (max_tokens > 0 && generated >= max_tokens) break;
             }
         }
     }
@@ -935,6 +942,8 @@ void error_usage() {
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
+    fprintf(stderr, "  -n <int>    max output tokens (0 = unlimited)\n");
+    fprintf(stderr, "  env NPU=1 enables NPU matmul for supported shapes\n");
     exit(EXIT_FAILURE);
 }
 
@@ -949,6 +958,7 @@ int main(int argc, char *argv[]) {
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
     int enable_thinking = 0;    // 1 enables thinking
     int ctx_length = 0;         // context length
+    int max_tokens = 0;         // max output tokens
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -966,6 +976,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'n') { max_tokens = atoi(argv[i + 1]); }
         else { error_usage(); }
     }
 
@@ -977,6 +988,8 @@ int main(int argc, char *argv[]) {
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path, ctx_length);
+    npu_matmul_init(&g_npu, &transformer.config, &transformer.weights);
+    npu_matmul_reset_stats(&g_npu);
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
@@ -991,15 +1004,18 @@ int main(int argc, char *argv[]) {
 
     // run!
     if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt);
+        generate(&transformer, &tokenizer, &sampler, prompt, max_tokens);
     } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt);
+        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, max_tokens);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode);
         error_usage();
     }
 
     // memory and file handles cleanup
+    fprintf(stderr, "matmul ops: npu=%llu cpu=%llu\n",
+            g_npu.npu_ops, g_npu.cpu_ops);
+    npu_matmul_shutdown(&g_npu);
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);

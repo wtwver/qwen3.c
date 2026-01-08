@@ -2,15 +2,19 @@
 # example override to clang: make run CC=clang
 CC = gcc
 
+NPU_SRCS = npu_matmul.c
+NPU_INCLUDES = -I../include
+NPU_LIBS = -ldrm
+
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
 run: runq.c
-	$(CC) -O3 -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
+	$(CC) -O3 -o runq -D_FILE_OFFSET_BITS=64 runq.c $(NPU_SRCS) $(NPU_INCLUDES) -lm $(NPU_LIBS)
 
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin -n 3
 debug: runq.c
-	$(CC) -g -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
+	$(CC) -g -o runq -D_FILE_OFFSET_BITS=64 runq.c $(NPU_SRCS) $(NPU_INCLUDES) -lm $(NPU_LIBS)
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
@@ -23,27 +27,27 @@ debug: runq.c
 # In our specific application this is *probably* okay to use
 .PHONY: fast
 fast: runq.c
-	$(CC) -Ofast -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
+	$(CC) -Ofast -o runq -D_FILE_OFFSET_BITS=64 runq.c $(NPU_SRCS) $(NPU_INCLUDES) -lm $(NPU_LIBS)
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
 # OMP_NUM_THREADS=4 ./runq out/model.bin
 .PHONY: openmp
 openmp: runq.c
-	$(CC) -Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 runq.c  -lm  -o runq
+	$(CC) -Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 runq.c $(NPU_SRCS) $(NPU_INCLUDES) -lm $(NPU_LIBS) -o runq
 
 .PHONY: win64
 win64:
-	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -D_FILE_OFFSET_BITS=64 -o runq.exe -I. runq.c win.c
+	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -D_FILE_OFFSET_BITS=64 -DQWEN3_DISABLE_NPU -o runq.exe -I. runq.c $(NPU_SRCS) win.c
 
 # compiles with gnu99 standard flags for amazon linux, coreos, etc. compatibility
 .PHONY: gnu
 gnu:
-	$(CC) -Ofast -std=gnu11 -o runq -D_FILE_OFFSET_BITS=64 runq.c -lm
+	$(CC) -Ofast -std=gnu11 -o runq -D_FILE_OFFSET_BITS=64 runq.c $(NPU_SRCS) $(NPU_INCLUDES) -lm $(NPU_LIBS)
 
 .PHONY: gnuopenmp
 gnuopenmp:
-	$(CC) -Ofast -fopenmp -std=gnu11 -D_FILE_OFFSET_BITS=64 runq.c  -lm  -o runq
+	$(CC) -Ofast -fopenmp -std=gnu11 -D_FILE_OFFSET_BITS=64 runq.c $(NPU_SRCS) $(NPU_INCLUDES) -lm $(NPU_LIBS) -o runq
 
 .PHONY: clean
 clean:
